@@ -1,7 +1,7 @@
 ---
 title: "Indices de prix immobiliers – Hauts-de-France (2010–2025)"
 subtitle: "Modèle hédonique sur données DVF / DV3F"
-author: "Master 1 Économétrie"
+author: "BAH ALPHA OUMAR & DIB ADEL"
 date: "`r Sys.Date()`"
 output:
   html_document:
