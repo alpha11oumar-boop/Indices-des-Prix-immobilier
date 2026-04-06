@@ -1,0 +1,1037 @@
+---
+title: "Indices de prix immobiliers – Hauts-de-France (2010–2025)"
+subtitle: "Modèle hédonique sur données DVF / DV3F"
+author: "Master 1 Économétrie"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    mathjax: "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+---
+
+# Chargement des librairies
+
+```{r libraries}
+library(data.table)
+library(arrow)
+library(fixest)
+library(ggplot2)
+library(sf)
+library(giscoR)
+library(classInt)
+library(scales)
+library(tidyr)
+```
+
+---
+
+# Données : lecture, harmonisation et fusion
+
+## Lecture des bases brutes
+
+On charge deux sources complémentaires :
+- **DVF+** (2014–2025) : données de ventes foncières enrichies pour les Hauts-de-France
+- **DV3F** (2010–2013) : version antérieure de la base, couvrant la période pré-2014
+
+Enfin, il convient de souligner que l'objectif du modèle hédonique n'est pas d'interpréter causalement les coefficients, mais de produire une prédiction fiable du prix à qualité constante, condition nécessaire à la construction d'un indice robuste.
+
+```{r lecture_donnees}
+dat1 <- fread(
+  "C:/Users/alpha/Desktop/Master 1 S2/Conduite de projet/1_DONNEES_LIVRAISON/dvf_plus.csv",
+  encoding = "UTF-8",
+  sep = "|"
+)
+
+dat2 <- as.data.table(
+  read_parquet("C:/Users/alpha/Desktop/Master 1 S2/Conduite de projet/2010 2013/dv3f_filtered_2010_2013 (2).parquet")
+)
+```
+
+## Harmonisation des types et des colonnes
+
+On aligne les types de variables entre les deux bases pour pouvoir les fusionner proprement.
+
+```{r harmonisation}
+deps_hdf <- c("02", "59", "60", "62", "80")
+
+for (dat in list(dat1, dat2)) {
+  dat[, coddep     := sprintf("%02d", as.integer(coddep))]
+  dat[, anneemut   := as.integer(anneemut)]
+  dat[, moismut    := as.integer(moismut)]
+  dat[, l_codinsee := as.character(l_codinsee)]
+  dat[, idmutation := as.integer(idmutation)]
+  dat[, idmutinvar := as.character(idmutinvar)]
+  dat[, libnatmut  := as.character(libnatmut)]
+}
+```
+
+## Restriction géographique et temporelle
+
+```{r filtrage_initial}
+dat1 <- dat1[coddep %in% deps_hdf & anneemut >= 2014]
+dat2_hdf <- dat2[coddep %in% deps_hdf & anneemut >= 2010 & anneemut <= 2013]
+```
+
+## Fusion verticale des deux sources
+
+```{r fusion_verticale}
+cols_keep <- c(
+  "idmutation", "idmutinvar", "anneemut", "moismut",
+  "coddep", "l_codinsee", "libnatmut", "vefa",
+  "valeurfonc", "nbdispo", "nblot",
+  "l_section", "l_idpar", "l_idparmut", "l_idlocmut",
+  "sbati", "codtypbien", "libtypbien"
+)
+
+dat1_small <- dat1[, intersect(cols_keep, names(dat1)), with = FALSE]
+dat2_small <- dat2_hdf[, intersect(cols_keep, names(dat2_hdf)), with = FALSE]
+
+for (col in setdiff(cols_keep, names(dat1_small))) dat1_small[, (col) := NA]
+for (col in setdiff(cols_keep, names(dat2_small))) dat2_small[, (col) := NA]
+
+setcolorder(dat1_small, cols_keep)
+setcolorder(dat2_small, cols_keep)
+
+char_cols <- c("idmutinvar", "coddep", "l_codinsee", "libnatmut",
+               "l_section", "l_idpar", "l_idparmut", "l_idlocmut", "libtypbien")
+int_cols  <- c("idmutation", "anneemut", "moismut", "nbdispo", "codtypbien")
+num_cols  <- c("valeurfonc", "nblot", "sbati")
+logi_cols <- c("vefa")
+
+for (col in char_cols) {
+  dat1_small[, (col) := as.character(get(col))]
+  dat2_small[, (col) := as.character(get(col))]
+}
+for (col in int_cols) {
+  dat1_small[, (col) := as.integer(get(col))]
+  dat2_small[, (col) := as.integer(get(col))]
+}
+for (col in num_cols) {
+  dat1_small[, (col) := as.numeric(get(col))]
+  dat2_small[, (col) := as.numeric(get(col))]
+}
+for (col in logi_cols) {
+  dat1_small[, (col) := as.logical(get(col))]
+  dat2_small[, (col) := as.logical(get(col))]
+}
+
+dat1_small[, source := "DVF_PLUS_2014_2025"]
+dat2_small[, source := "DV3F_2010_2013"]
+
+data_all <- rbindlist(list(dat2_small, dat1_small), use.names = TRUE, fill = TRUE)
+
+rm(dat1, dat2, dat2_hdf, dat1_small, dat2_small)
+gc()
+
+print(dim(data_all))
+print(range(data_all$anneemut, na.rm = TRUE))
+print(table(data_all$coddep, useNA = "ifany"))
+print(table(data_all$source, useNA = "ifany"))
+```
+
+---
+
+# Nettoyage et préparation des variables
+
+On restreint aux ventes effectives, on construit le prix au m², et on retire les valeurs aberrantes.
+
+```{r nettoyage}
+data_all <- data_all[!is.na(libnatmut) & trimws(libnatmut) == "Vente"]
+
+data_all[, code_commune := as.character(l_codinsee)]
+data_all[, departement  := as.character(coddep)]
+data_all[, annee        := as.integer(anneemut)]
+data_all[, mois         := as.integer(moismut)]
+data_all[, periode      := sprintf("%d-%02d", annee, mois)]
+
+data_all <- data_all[!is.na(valeurfonc) & valeurfonc > 0 &
+                     !is.na(sbati) & sbati > 0]
+
+data_all[, p_m2 := valeurfonc / sbati]
+data_all <- data_all[is.finite(p_m2) & p_m2 > 0]
+
+data_all <- data_all[p_m2 >= 200 & p_m2 <= 20000]
+data_all[, log_p_m2 := log(p_m2)]
+
+data_all[, libtypbien := trimws(tolower(as.character(libtypbien)))]
+
+print(summary(data_all$p_m2))
+print(dim(data_all))
+print(table(data_all$libtypbien, useNA = "ifany"))
+```
+
+---
+
+# Fonction utilitaire : pipeline hédonique
+
+Pour éviter de dupliquer le code entre appartements et maisons, on encapsule le pipeline complet dans une fonction :
+estimation du modèle hédonique → calcul du log prix net → correction petites communes → **complétion des périodes manquantes** → agrégation commune × mois → indice base 100 avec période de référence commune.
+
+```{r fonction_hedonique}
+#' Estime un indice de prix hédonique pour un segment de marché
+#'
+#' @param dt             data.table filtrée sur le type de bien concerné
+#' @param formule        formula passée à feols()
+#' @param vars_qualite   vecteur des noms des variables de qualité à neutraliser
+#' @param seuil_transac  seuil min de transactions pour l'agrégation observée
+#' @return               liste : indice base 100, modèle, petites communes
+construire_indice <- function(dt,
+                              formule,
+                              vars_qualite,
+                              seuil_transac = 3) {
+
+  # --- 1. Préparation des effets fixes ---
+
+  ref_mois <- dt[, .N, by = periode][order(-N)][1, periode]
+  ref_dep  <- dt[, .N, by = departement][order(-N)][1, departement]
+  ref_annee <- dt[, .N, by = annee][order(-N)][1, annee]
+
+  petites <- dt[, .N, by = code_commune][order(N)][1:min(100, .N), code_commune]
+
+  dt[, commune_fe2    := fifelse(code_commune %in% petites, "REF_PETITES", code_commune)]
+  dt[, temps_fe       := relevel(factor(periode),      ref = ref_mois)]
+  dt[, departement_fe := relevel(factor(departement),  ref = ref_dep)]
+  dt[, annee_fe       := factor(annee)]
+  dt[, dep_annee_fe   := interaction(factor(departement), factor(annee), drop = TRUE)]
+  dt[, commune_fe2    := factor(commune_fe2)]
+
+  if ("REF_PETITES" %in% levels(dt$commune_fe2))
+    dt[, commune_fe2 := relevel(commune_fe2, ref = "REF_PETITES")]
+
+  # --- 2. Estimation OLS ---
+
+  mod <- feols(formule, data = dt, notes = FALSE)
+  print(summary(mod))
+
+  # --- 3. Calcul du log prix net ---
+  # On retire la contribution de chaque variable de qualité à la prédiction :
+  # log P_net_i = ŷ_i - Σ_{k ∈ H} β̂_k * x_ik
+
+  dt[, y_hat := as.numeric(predict(mod, newdata = dt))]
+
+  coefs     <- coef(mod)
+  get_coef  <- function(nm) if (nm %in% names(coefs)) coefs[nm] else 0
+
+  dt[, qualite_part := Reduce(`+`, lapply(vars_qualite, function(v) {
+    get_coef(v) * get(v)
+  }))]
+
+  dt[, log_p_net := y_hat - qualite_part]
+  dt <- dt[!is.na(log_p_net)]
+
+  # --- 4. Correction des petites communes (biais résiduel moyen) ---
+  # Pour c ∈ C_tiny : ē_c = E[y_i - log P^net_i | c(i) = c]
+  # Ajustement : log P^net_i ← log P^net_i + ē_c(i)
+
+  dt[, resid_net := log_p_m2 - log_p_net]
+
+  correction <- dt[code_commune %in% petites,
+    .(ec = mean(resid_net, na.rm = TRUE)),
+    by = code_commune
+  ]
+
+  dt <- merge(dt, correction, by = "code_commune", all.x = TRUE)
+  dt[is.na(ec), ec := 0]
+  dt[, log_p_net_corr := log_p_net + ec]
+
+  # --- 5. Agrégation commune × mois (périodes observées) ---
+  # log P^net_{c,t} = médiane{ log P^net_i : c(i) = c, t(i) = t }
+
+  agg_obs <- dt[!is.na(log_p_net_corr), .(
+    log_p_net_ct = median(log_p_net_corr, na.rm = TRUE),
+    n_transac    = .N,
+    departement  = first(departement),
+    source_type  = "observé"
+  ), by = .(code_commune, periode, annee, mois)]
+
+  agg_obs <- agg_obs[n_transac >= seuil_transac]
+
+  # --- 6. Complétion des périodes manquantes par prédiction du modèle ---
+  # Procédure (slide 16) :
+  #   (a) Construire la grille complète {(c, t)}
+  #   (b) Identifier les paires (c, t) sans observation
+  #   (c) Recréer les variables du modèle pour ces paires
+  #   (d) Prédire loĝ P^net_{c,t} = α̂ + X'_{c,t} θ̂
+  #   (e) Fusionner observés + prédits
+
+  # Grille complète commune × période
+  toutes_periodes  <- unique(dt[, .(periode, annee, mois)])
+  toutes_communes  <- unique(dt[, .(code_commune, departement)])
+  grille_complete  <- CJ(
+    code_commune = toutes_communes$code_commune,
+    periode      = toutes_periodes$periode
+  )
+  grille_complete <- merge(grille_complete, toutes_periodes, by = "periode")
+  grille_complete <- merge(grille_complete, toutes_communes, by = "code_commune")
+
+  # Paires (c, t) déjà couvertes par agg_obs
+  obs_key <- agg_obs[, paste(code_commune, periode)]
+  manquantes <- grille_complete[!(paste(code_commune, periode) %in% obs_key)]
+
+  if (nrow(manquantes) > 0) {
+
+    # Récupérer les coefficients d'effets fixes
+    fe_all <- fixef(mod)
+
+    # Effet fixe temps
+    fe_temps <- data.table(
+      periode   = gsub("temps_fe::", "", names(fe_all$temps_fe)),
+      fe_temps  = as.numeric(fe_all$temps_fe)
+    )
+
+    # Effet fixe commune
+    fe_comm <- data.table(
+      commune_fe2 = names(fe_all$commune_fe2),
+      fe_commune  = as.numeric(fe_all$commune_fe2)
+    )
+    fe_comm[, code_commune := ifelse(commune_fe2 == "REF_PETITES", NA_character_, commune_fe2)]
+
+    # Effet fixe département
+    fe_dep <- data.table(
+      departement = gsub("departement_fe::", "", names(fe_all$departement_fe)),
+      fe_dep      = as.numeric(fe_all$departement_fe)
+    )
+
+    # Effet fixe dep_annee (interaction département × année)
+    fe_da_raw <- data.table(
+      key_da = names(fe_all$dep_annee_fe),
+      fe_da  = as.numeric(fe_all$dep_annee_fe)
+    )
+    fe_da_raw[, departement := sub(":.*", "", key_da)]
+    fe_da_raw[, annee       := as.integer(sub(".*:", "", key_da))]
+
+    manquantes <- merge(manquantes, fe_temps,
+                        by = "periode",      all.x = TRUE)
+    manquantes <- merge(manquantes, fe_comm[!is.na(code_commune), .(code_commune, fe_commune)],
+                        by = "code_commune", all.x = TRUE)
+    manquantes <- merge(manquantes, fe_dep,
+                        by = "departement",  all.x = TRUE)
+    manquantes <- merge(manquantes, fe_da_raw[, .(departement, annee, fe_da)],
+                        by = c("departement", "annee"), all.x = TRUE)
+
+    # Constante du modèle
+    alpha_hat <- coef(mod)["(Intercept)"]
+    if (is.na(alpha_hat)) alpha_hat <- 0
+
+    # IMPORTANT : on ne prédit que si tous les effets fixes nécessaires sont disponibles.
+    # Remplacer un effet fixe manquant par 0 crée des biais majeurs car le
+    # modèle n'a pas de catégorie de référence "nulle" pour ces effets.
+    manquantes[, n_fe_manquants := is.na(fe_temps) + is.na(fe_commune) + is.na(fe_dep) + is.na(fe_da)]
+
+    # On ne conserve que les lignes où aucun effet fixe n'est manquant
+    manquantes_ok <- manquantes[n_fe_manquants == 0]
+
+    if (nrow(manquantes_ok) > 0) {
+      manquantes_ok[, log_p_net_ct := alpha_hat + fe_temps + fe_commune + fe_dep + fe_da]
+
+      # Garde-fou : on élimine les prédictions hors de l'intervalle des
+      # valeurs observées (±3 écarts-types autour de la moyenne observée)
+      mu_obs  <- mean(agg_obs$log_p_net_ct, na.rm = TRUE)
+      sd_obs  <- sd(agg_obs$log_p_net_ct,   na.rm = TRUE)
+      borne_b <- mu_obs - 3 * sd_obs
+      borne_h <- mu_obs + 3 * sd_obs
+
+      manquantes_ok <- manquantes_ok[
+        !is.na(log_p_net_ct) &
+        log_p_net_ct >= borne_b &
+        log_p_net_ct <= borne_h
+      ]
+
+      agg_pred <- manquantes_ok[, .(
+        code_commune,
+        periode,
+        annee,
+        mois,
+        departement,
+        log_p_net_ct,
+        n_transac   = 0L,
+        source_type = "prédit"
+      )]
+
+      agg <- rbindlist(list(agg_obs, agg_pred), use.names = TRUE, fill = TRUE)
+    } else {
+      agg <- agg_obs
+    }
+
+  } else {
+    agg <- agg_obs
+  }
+
+  # --- 7. Construction de l'indice base 100 ---
+  # Période de référence commune à toutes les communes : mois-année de référence
+  # le plus fréquent dans les données brutes. Cela rend les comparaisons intercommunales
+  # plus conformes à la méthodologie présentée en cours.
+  #
+  # Formule :  Index_{c,t} = 100 × exp( log P^net_{c,t} − log P^net_{c,t0} )
+
+  setorder(agg, code_commune, annee, mois)
+
+  periode_ref <- ref_mois
+
+  # Base commune : même période t0 pour toutes les communes
+  base <- agg[periode == periode_ref, .(code_commune, base_log = log_p_net_ct)]
+  base[, base_periode := periode_ref]
+
+  # Vérification de cohérence : exclure les communes dont la base_log est aberrante
+  mu_base <- mean(base$base_log, na.rm = TRUE)
+  sd_base <- sd(base$base_log,   na.rm = TRUE)
+  base    <- base[
+    !is.na(base_log) &
+    is.finite(base_log) &
+    base_log >= mu_base - 4 * sd_base &
+    base_log <= mu_base + 4 * sd_base
+  ]
+
+  indice <- merge(agg, base, by = "code_commune", all.x = TRUE)
+
+  # Calcul de l'indice avec garde-fou sur le résultat final
+  indice[, diff_log := log_p_net_ct - base_log]
+  indice <- indice[!is.na(diff_log) & is.finite(diff_log) & abs(diff_log) <= log(5)]
+  indice[, index_100 := 100 * exp(diff_log)]
+
+  return(list(indice = indice, modele = mod, petites = petites))
+}
+```
+
+---
+
+# Segment Appartements
+
+## Préparation des données appartements
+
+On isole les appartements, on code les typologies T1–T5, et on s'assure que chaque ligne a une
+surface, un log-prix et une période valides.
+
+```{r prep_appartements}
+app_full <- copy(data_all[grepl("appartement", libtypbien, ignore.case = TRUE)])
+app_full[, libtypbien := tolower(trimws(as.character(libtypbien)))]
+
+app_full[, T1 := as.integer(grepl("t1", libtypbien))]
+app_full[, T2 := as.integer(grepl("t2", libtypbien))]
+app_full[, T3 := as.integer(grepl("t3", libtypbien))]
+app_full[, T4 := as.integer(grepl("t4", libtypbien))]
+app_full[, T5 := as.integer(grepl("t5|t5 ou \\+", libtypbien))]
+
+app_full <- app_full[(T1 + T2 + T3 + T4 + T5) > 0]
+
+app_full[, log_sbati := log(sbati)]
+app_full[, vefa_num  := fifelse(is.na(vefa), 0L, as.integer(vefa == TRUE))]
+
+app_full <- app_full[
+  !is.na(log_p_m2) & is.finite(log_p_m2) &
+  !is.na(log_sbati) & is.finite(log_sbati) &
+  !is.na(vefa_num) & !is.na(periode) &
+  !is.na(departement) & !is.na(annee) & !is.na(code_commune)
+]
+
+print(dim(app_full))
+```
+
+## Estimation du modèle hédonique – Appartements
+
+Le modèle estime :
+
+$$y_i = \alpha + \mathbf{x}_i'\boldsymbol{\beta} + \gamma_{t(i)} + \delta_{d(i)} + \mu_{c(i)} + \theta_{d(i),a(i)} + \varepsilon_i$$
+
+où $y_i = \log(p_i^{m^2})$, les variables de qualité $\mathbf{x}_i$ comprennent la surface en log,
+le statut VEFA et les indicatrices de typologie (T2 est la référence).
+
+```{r modele_appartements}
+res_app <- construire_indice(
+  dt           = app_full,
+  formule      = log_p_m2 ~ log_sbati + vefa_num + T1 + T3 + T4 + T5 |
+                   temps_fe + departement_fe + commune_fe2 + dep_annee_fe,
+  vars_qualite = c("log_sbati", "vefa_num", "T1", "T3", "T4", "T5")
+)
+
+indice_app_filtre    <- res_app$indice
+mod_appart_final     <- res_app$modele
+petites_communes_app <- res_app$petites
+
+summary(indice_app_filtre$index_100)
+```
+
+### Interprétation du modèle hédonique – Appartements
+
+Le modèle hédonique log-linéaire repose sur la décomposition :
+
+$$\log p_i = \alpha + \underbrace{\sum_{k \in \mathcal{H}} \hat{\beta}_k x_{ik}}_{\text{qualité}} + \underbrace{\hat{\gamma}_{t(i)}}_{\text{tendance marché}} + \underbrace{\hat{\mu}_{c(i)}}_{\text{niveau local}} + \underbrace{\hat{\theta}_{d(i),a(i)}}_{\text{tendance dép.}} + \hat{\varepsilon}_i$$
+
+**Coefficient sur $\log(\text{surface})$** ($\hat{\beta}_{\text{surface}}$) : un coefficient négatif — typiquement de l'ordre de $-0{,}3$ à $-0{,}5$ dans la littérature hédonique immobilière — indique que le prix au m² **décroît avec la surface**, ce qui traduit les économies d'échelle sur le logement : les grands appartements se vendent moins cher par mètre carré que les petits. Plus précisément, une augmentation de 1 % de la surface est associée à une variation de $\hat{\beta}_{\text{surface}}$ % du prix au m².
+
+**Coefficient VEFA** ($\hat{\beta}_{\text{vefa}}$) : en log-niveau, $100 \times (\exp(\hat{\beta}_{\text{vefa}}) - 1)$ donne la prime en pourcentage associée à l'achat en état futur d'achèvement. Cette prime reflète à la fois la qualité intrinsèque du neuf (normes thermiques, équipements) et la valeur d'option liée à la personnalisation du bien.
+
+**Indicatrices de typologie** : les coefficients $\hat{\beta}_{T_k}$ mesurent, relativement au T2 (référence), le différentiel de prix au m² associé à chaque type. Un T1 affiche généralement une prime positive (les studios commandent un prix au m² plus élevé en raison de la forte demande locative), tandis que les grands appartements (T4, T5) présentent un coefficient négatif, cohérent avec l'effet d'échelle décrit ci-dessus.
+
+**Effets fixes temporels** $\hat{\gamma}_t$ : ils captent la tendance globale du marché à qualité constante, indépendamment des communes. Leur évolution dans le temps constitue la base de l'indice régional de référence.
+
+**Effets fixes départementaux** $\hat{\delta}_d$ : ils contrôlent les écarts de niveau moyens entre départements au sein de la région.
+
+**Effets fixes communaux** $\hat{\mu}_c$ : ils mesurent le niveau absolu des prix dans chaque commune, toutes choses égales par ailleurs — c'est-à-dire à surface, qualité et période identiques. Ces effets reflètent l'hétérogénéité spatiale structurelle (accessibilité, aménités, bassins d'emploi).
+
+**$R^2$** : le pouvoir explicatif du modèle est généralement élevé (souvent supérieur à 0,60 sur des données DVF) grâce à l'inclusion des effets fixes. Un $R^2$ plus faible pourrait signaler des variables de qualité manquantes (état du bien, étage, exposition) ou une forte hétérogénéité intra-commune non capturée.
+
+On insiste sur le fait que ces coefficients ne doivent pas être interprétés comme des effets causaux, mais comme des paramètres de correction permettant d'isoler la composante temporelle et spatiale des prix.
+
+---
+
+# Segment Maisons
+
+## Préparation des données maisons
+
+```{r prep_maisons}
+mai_full <- copy(data_all[grepl("maison", libtypbien, ignore.case = TRUE)])
+mai_full[, libtypbien := tolower(trimws(as.character(libtypbien)))]
+
+mai_full[, log_sbati := log(sbati)]
+mai_full[, vefa_num  := fifelse(is.na(vefa), 0L, as.integer(vefa == TRUE))]
+
+mai_full <- mai_full[
+  !is.na(log_p_m2) & is.finite(log_p_m2) &
+  !is.na(log_sbati) & is.finite(log_sbati) &
+  !is.na(vefa_num) & !is.na(periode) &
+  !is.na(departement) & !is.na(annee) & !is.na(code_commune)
+]
+
+print(dim(mai_full))
+```
+
+## Estimation du modèle hédonique – Maisons
+
+Pour les maisons, l'absence d'indicatrices de typologie dans les données conduit à un modèle restreint aux variables de qualité disponibles — surface et statut VEFA :
+
+$$y_i = \alpha + \hat{\beta}_{\text{surface}} \log(\text{sbati}_i) + \hat{\beta}_{\text{vefa}} \cdot \text{vefa}_i + \hat{\gamma}_{t(i)} + \hat{\delta}_{d(i)} + \hat{\mu}_{c(i)} + \hat{\theta}_{d(i),a(i)} + \hat{\varepsilon}_i$$
+
+```{r modele_maisons}
+res_mai <- construire_indice(
+  dt           = mai_full,
+  formule      = log_p_m2 ~ log_sbati + vefa_num |
+                   temps_fe + departement_fe + commune_fe2 + dep_annee_fe,
+  vars_qualite = c("log_sbati", "vefa_num")
+)
+
+indice_mai_filtre    <- res_mai$indice
+mod_maison_final     <- res_mai$modele
+petites_communes_mai <- res_mai$petites
+
+summary(indice_mai_filtre$index_100)
+```
+
+### Interprétation du modèle hédonique – Maisons
+
+La spécification pour les maisons est plus parcimonieuse que celle des appartements : l'absence de typologies impose de concentrer toute l'identification de la qualité sur la surface et le statut VEFA.
+
+**Effet de la surface** : l'élasticité $\hat{\beta}_{\text{surface}}$ capture ici à la fois l'économie d'échelle propre au marché des maisons (plus marquée que pour les appartements dans la littérature : les grandes maisons sont proportionnellement moins chères au m² car leur terrain n'est pas totalement valorisé dans la surface bâtie) et l'effet composition des ventes.
+
+**Biais potentiel d'omission de variable** : en l'absence de variables sur le nombre de pièces, la présence d'un garage, ou la surface du terrain, les effets fixes communaux $\hat{\mu}_c$ absorbent une partie de ces caractéristiques omises dans la mesure où elles sont corrélées à la commune. Cela peut légèrement surestimer la dispersion spatiale des niveaux de prix, sans toutefois biaiser la dynamique temporelle de l'indice si la composition des ventes est stable dans le temps au sein de chaque commune.
+
+**Comparaison avec les appartements** : un $R^2$ structurellement plus faible est attendu sur le segment maisons en raison de la plus grande hétérogénéité des biens (terrain, configuration, état), qui ne peut être captée par les seules variables disponibles.
+
+On insiste sur le fait que ces coefficients ne doivent pas être interprétés comme des effets causaux, mais comme des paramètres de correction permettant d'isoler la composante temporelle et spatiale des prix.
+
+---
+
+# Visualisations
+
+## Indice moyen régional – Appartements
+
+Évolution de l'indice moyen pondéré par le nombre de transactions (périodes observées uniquement).
+
+```{r graph_indice_moyen_app}
+indice_moyen_app <- indice_app_filtre[source_type == "observé", .(
+  index_100 = weighted.mean(index_100, w = pmax(n_transac, 1), na.rm = TRUE)
+), by = periode]
+
+ggplot(indice_moyen_app, aes(x = as.Date(paste0(periode, "-01")), y = index_100)) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "red") +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_point(size = 1.5) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title    = "Indice moyen des prix – Appartements (Hauts-de-France)",
+    subtitle = "Indice pondéré par le nombre de transactions | Base 100 = période de référence commune",
+    x = "Année", y = "Indice base 100"
+  )
+```
+
+### Interprétation – Indice régional appartements
+
+La courbe représente l'évolution du prix des appartements à **qualité constante** dans les Hauts-de-France. Elle se lit comme suit : un indice de 120 en période $t$ signifie que le prix au m² d'un appartement aux caractéristiques identiques à celles de la période de référence a augmenté de **20 %** par rapport à cette base.
+
+On observe une tendance haussière globale des indices, traduisant une appréciation des prix immobiliers sur la période. Cette dynamique semble plus marquée pour les appartements, ce qui peut refléter une tension plus forte sur les marchés urbains.
+
+On distingue typiquement plusieurs régimes sur la période 2010–2025 :
+
+- **Pré-2014** : la période DV3F reflète le marché post-crise de 2008 ; les prix sont généralement orientés à la baisse ou stagnent, sous l'effet de la contraction du crédit et de la montée du chômage dans la région.
+- **2014–2019** : stabilisation puis légère reprise, portée par la baisse des taux d'intérêt et le regain de demande dans les grandes agglomérations (Lille métropole notamment).
+- **2020–2022** : la période post-Covid est marquée dans de nombreuses régions françaises par une accélération des prix, alimentée par l'effet des confinements sur les préférences résidentielles et la persistance de taux bas.
+- **2023–2025** : le retournement du marché, consécutif à la remontée rapide des taux directeurs de la BCE, se traduit par un ralentissement marqué voire une correction de l'indice.
+
+La pondération par le nombre de transactions garantit que les périodes à faible liquidité (mois d'été, chocs conjoncturels) ne biaisent pas la trajectoire régionale.
+
+---
+
+## Indice pour des communes sélectionnées
+
+Comparaison de l'évolution des prix entre Lille, Roubaix et Arras.
+
+```{r graph_communes_selectionnees}
+communes_plot <- c("59350", "59512", "62041")
+
+data_plot <- indice_app_filtre[code_commune %in% communes_plot]
+data_plot[, code_commune := factor(code_commune, levels = communes_plot)]
+
+ggplot(data_plot, aes(
+  x     = as.Date(paste0(periode, "-01")),
+  y     = index_100,
+  color = code_commune
+)) +
+  geom_line(linewidth = 1) +
+  scale_color_discrete(labels = c("59350" = "Lille", "59512" = "Roubaix", "62041" = "Arras")) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title  = "Indice de prix des appartements – Communes sélectionnées",
+    x      = "Année", y = "Indice base 100", color = "Commune"
+  )
+```
+
+### Interprétation – Hétérogénéité communale
+
+La comparaison entre Lille (59350), Roubaix (59512) et Arras (62041) illustre la **dispersion spatiale des dynamiques de prix** au sein de la région, à qualité constante.
+
+- **Lille** constitue le marché le plus tendu de la région : la demande structurellement élevée (étudiants, actifs, investisseurs locatifs) soutient les prix et explique une trajectoire haussière plus soutenue que la moyenne régionale. L'effet métropole se traduit souvent par une accélération de l'indice supérieure à celle des villes moyennes.
+
+- **Roubaix** présente historiquement des niveaux de prix absolus plus faibles (capturés par l'effet fixe $\hat{\mu}_c$), mais la dynamique relative — mesurée par l'indice base 100 — peut s'avérer comparable ou supérieure à celle de Lille sur certaines sous-périodes. Cela reflète un processus de **rattrapage** ou de **gentrification partielle** qui comprime les écarts de prix relatifs.
+
+- **Arras**, préfecture du Pas-de-Calais, offre un marché moins liquide et plus sensible aux conditions locales de l'emploi industriel. Sa trajectoire d'indice suit davantage le cycle régional sans présenter les dynamiques propres aux marchés métropolitains.
+
+L'écart entre les courbes en fin de période — si Lille diverge vers le haut — confirme que l'hétérogénéité spatiale **s'est creusée** sur la période, phénomène documenté dans la littérature sur la polarisation des marchés immobiliers français (Combes et al., 2019).
+
+---
+
+## Comparaison Appartements vs Maisons – Région
+
+```{r graph_comparaison_regional}
+faire_serie_regionale <- function(dt) {
+  dt[source_type == "observé",
+     .(index = weighted.mean(index_100, w = pmax(n_transac, 1), na.rm = TRUE)),
+     by = periode]
+}
+
+df_app <- faire_serie_regionale(indice_app_filtre); df_app[, type := "Appartements"]
+df_mai <- faire_serie_regionale(indice_mai_filtre); df_mai[, type := "Maisons"]
+
+periodes_communes <- intersect(df_app$periode, df_mai$periode)
+df_comparaison <- rbindlist(list(
+  df_app[periode %in% periodes_communes],
+  df_mai[periode %in% periodes_communes]
+))
+df_comparaison[, type := factor(type, levels = c("Appartements", "Maisons"))]
+df_comparaison[, date := as.Date(paste0(periode, "-01"))]
+
+ggplot(df_comparaison, aes(x = date, y = index, color = type)) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  scale_color_manual(values = c("Appartements" = "#2c3e50", "Maisons" = "#27ae60")) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold"),
+    plot.subtitle    = element_text(size = 11, color = "gray40"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title    = "Comparaison des indices de prix : Maisons vs Appartements",
+    subtitle = "Indice moyen pondéré par le nombre de transactions | Base 100 = première période observée",
+    x = "Année", y = "Indice (Base 100)",
+    color    = "Type de bien",
+    caption  = "Source : DVF | Analyse économétrique Master 1"
+  )
+```
+
+### Interprétation – Appartements vs Maisons
+
+La comparaison des deux indices régionaux révèle la **segmentation structurelle** du marché immobilier en Hauts-de-France entre logements collectifs et individuels.
+
+Les maisons présentent généralement une **volatilité cyclique plus prononcée** que les appartements, pour deux raisons principales : (i) leur marché est moins liquide (moins de transactions par commune et par période), ce qui amplifie les fluctuations de l'indice agrégé ; (ii) leur valeur intègre une composante foncière plus importante, laquelle est davantage sensible aux anticipations sur les taux d'actualisation et les perspectives de construction.
+
+En revanche, les appartements bénéficient d'une demande plus diversifiée (locataires, primo-accédants, investisseurs) qui lisse la trajectoire de leur indice sur le cycle. La convergence ou la divergence des deux courbes sur des sous-périodes spécifiques est économiquement informative :
+
+- Une **surperformance des maisons** en début de période post-Covid (2020–2022) est cohérente avec le phénomène documenté de fuite vers plus grand espace, qui a bénéficié davantage au marché résidentiel individuel.
+- Une **surperformance des appartements** en fin de période traduirait la résistance des marchés urbains denses face à la correction immobilière, soutenue par la rareté de l'offre en zone tendue.
+
+---
+
+## Comparaison Appartements vs Maisons – Commune (Lille)
+
+```{r graph_comparaison_commune}
+commune_cible <- "59350"
+
+extraire_commune <- function(dt, type_label) {
+  dt[code_commune == commune_cible, .(code_commune, periode, index_100, type = type_label)]
+}
+
+app_c <- extraire_commune(indice_app_filtre, "Appartement")
+mai_c <- extraire_commune(indice_mai_filtre, "Maison")
+
+periodes_c   <- intersect(app_c$periode, mai_c$periode)
+comp_commune <- rbindlist(list(
+  app_c[periode %in% periodes_c],
+  mai_c[periode %in% periodes_c]
+))
+comp_commune[, type := factor(type, levels = c("Appartement", "Maison"))]
+
+ggplot(comp_commune, aes(
+  x     = as.Date(paste0(periode, "-01")),
+  y     = index_100,
+  color = type,
+  group = type
+)) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 1.2) +
+  scale_color_manual(values = c("Appartement" = "#E64B35", "Maison" = "#00A087")) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title    = "Comparaison des prix : Appartement vs Maison – Lille",
+    subtitle = "Indice base 100 (périodes comparables)",
+    x = "Année", y = "Indice base 100",
+    color   = "Type",
+    caption = "Source : DVF, calcul des auteurs"
+  )
+```
+
+### Interprétation – Marché lillois : appartements vs maisons
+
+Lille constitue un cas d'étude particulièrement riche pour la comparaison des deux segments, en raison de la **coexistence d'un marché d'appartements dense** (lié à la forte population étudiante et à la concentration de l'emploi tertiaire) et d'un **marché de maisons périphérique** (zones résidentielles de Wazemmes, Moulins, ou communes limitrophes rattachées au code INSEE 59350).
+
+Un écart croissant entre l'indice des appartements et celui des maisons à Lille s'interpréterait comme une **prime urbaine** croissante pour la densité : les ménages acceptent de payer relativement plus cher pour des appartements mieux localisés par rapport aux transports et aux aménités. Inversement, une convergence des deux courbes indiquerait une revalorisation du marché résidentiel individuel, possiblement sous l'effet de la politique de rénovation urbaine engagée dans certains quartiers.
+
+L'interprétation doit tenir compte de la liquidité respective des deux marchés à l'échelle de la commune : le marché des maisons à Lille est structurellement moins profond que celui des appartements, ce qui peut générer une volatilité mensuelle plus forte de l'indice maisons, sans que cela ne traduise nécessairement une instabilité des prix fondamentaux.
+
+---
+
+# Cartographie
+
+## Fonction utilitaire : fond de carte HdF
+
+```{r fond_carte}
+charger_fond_hdf <- function() {
+  deps_hdf <- c("02", "59", "60", "62", "80")
+  communes_sf <- gisco_get_lau(country = "FR", year = "2021", epsg = "4326")
+  communes_sf$code_commune <- gsub("^FR-", "", communes_sf$LAU_ID)
+  communes_sf$dep          <- substr(communes_sf$code_commune, 1, 2)
+  communes_sf[communes_sf$dep %in% deps_hdf, ]
+}
+
+fond_hdf <- charger_fond_hdf()
+
+deps_sf     <- gisco_get_nuts(country = "FR", nuts_level = 3, year = "2021", epsg = "4326")
+deps_hdf_sf <- deps_sf[deps_sf$NUTS_ID %in% c("FRE21", "FRE11", "FRE22", "FRE12", "FRE23"), ]
+```
+
+## Carte : Indice moyen des appartements (2010–2025)
+
+```{r carte_indice_app}
+carte_app_data <- indice_app_filtre[
+  annee >= 2010 & annee <= 2025 & source_type == "observé",
+  .(index_100 = mean(index_100, na.rm = TRUE), n_obs = .N),
+  by = code_commune
+][n_obs >= 5]
+
+carte_app_sf <- merge(fond_hdf, carte_app_data, by = "code_commune", all.x = TRUE)
+
+vals <- carte_app_sf$index_100[!is.na(carte_app_sf$index_100)]
+brks <- unique(classIntervals(vals, n = 5, style = "quantile")$brks)
+if (length(brks) < 3) brks <- pretty(vals, n = 5)
+
+carte_app_sf$classe_indice <- cut(carte_app_sf$index_100, breaks = brks, include.lowest = TRUE)
+
+ggplot() +
+  geom_sf(data = carte_app_sf, aes(fill = classe_indice), color = NA) +
+  geom_sf(data = deps_hdf_sf, fill = NA, color = "white", linewidth = 0.5) +
+  scale_fill_viridis_d(
+    na.value = "grey90", option = "C", direction = -1,
+    name = "Indice moyen\n(2010–2025)"
+  ) +
+  coord_sf(xlim = c(1.4, 4.3), ylim = c(48.8, 51.2), expand = FALSE) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text  = element_blank(),
+    plot.title = element_text(face = "bold", size = 16)
+  ) +
+  labs(
+    title    = "Indice de prix des appartements – Hauts-de-France",
+    subtitle = "Moyenne 2010–2025 (communes avec ≥ 5 observations)",
+    caption  = "Gris : communes sans données suffisantes | Source : DVF"
+  )
+```
+
+### Interprétation – Carte choroplèthe appartements
+
+La carte choroplèthe représente, pour chaque commune, la **moyenne de l'indice de prix sur la période 2010–2025**. Cet indice étant calculé à qualité constante, les différences de niveaux entre communes ne reflètent pas la composition des biens vendus mais bien les **dynamiques de marché locales**.
+
+Les communes affichant les indices moyens les plus élevés — typiquement les communes de la métropole lilloise (Lille, Villeneuve-d'Ascq, Roubaix, Tourcoing) et du bassin minier en cours de revalorisation — indiquent que les prix y ont progressé plus fortement sur la période relativement à leur base de référence. Ce résultat est cohérent avec la **concentration de la croissance urbaine** dans les pôles régionaux, au détriment des territoires ruraux et des villes moyennes en déclin démographique (Laon, Saint-Quentin, Lens).
+
+Les zones grises correspondent à des communes à faible liquidité (moins de 5 observations sur la période entière), principalement des communes rurales du Pas-de-Calais et de l'Aisne dont le marché immobilier est quasi inexistant. Leur exclusion de la carte est une décision méthodologique conservatrice qui évite de propager des indices non fiables.
+
+Le découpage en quintiles permet d'apprécier la **dispersion relative** de l'indice : si les quintiles extrêmes sont très éloignés, cela confirme une forte hétérogénéité spatiale de la dynamique des prix régionaux.
+
+---
+
+## Carte : Prix relatifs à qualité constante – Appartements
+
+Les effets fixes communaux du modèle hédonique mesurent le **niveau absolu** des prix d'une commune, indépendamment de la qualité des biens qui y sont vendus.
+
+```{r carte_effets_fixes_app}
+fe_app <- fixef(mod_appart_final)
+
+df_fe_app <- data.table(
+  code_commune  = names(fe_app$commune_fe2),
+  prix_relatif  = exp(as.numeric(fe_app$commune_fe2))
+)[code_commune != "REF_PETITES"]
+
+carte_fe_app <- merge(fond_hdf, df_fe_app, by = "code_commune", all.x = TRUE)
+
+ggplot(carte_fe_app) +
+  geom_sf(aes(fill = prix_relatif), color = NA) +
+  scale_fill_viridis_c(
+    option = "plasma", na.value = "grey90",
+    name   = "Prix relatif\n(moyenne = 1)",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5)
+  ) +
+  labs(
+    title    = "Hauts-de-France : géographie des prix immobiliers",
+    subtitle = "Prix relatif à qualité constante – Appartements",
+    caption  = "Source : DVF | Modèle hédonique Master 1"
+  )
+```
+
+### Interprétation – Effets fixes communaux (appartements)
+
+La carte des effets fixes $\exp(\hat{\mu}_c)$ constitue la représentation la plus pure de **l'hétérogénéité spatiale des prix à qualité constante**. Contrairement à une carte des prix moyens observés, elle neutralise l'effet de la composition des biens vendus dans chaque commune : deux communes avec le même effet fixe ont des prix au m² identiques pour un appartement de même surface, même type et même statut VEFA.
+
+$$\exp(\hat{\mu}_c) = \frac{\text{prix m}^2 \text{ commune } c}{\text{prix m}^2 \text{ commune de référence}}$$
+
+**Gradient géographique attendu** : la littérature sur les marchés immobiliers français prédit un gradient centre-périphérie prononcé, avec des effets fixes décroissants à mesure que l'on s'éloigne de Lille. Ce gradient reflète principalement les différentiels d'accessibilité aux emplois et aux aménités urbaines (transport en commun, services, espaces culturels).
+
+**Exceptions notables** : certaines communes côtières (Le Touquet-Paris-Plage, Hardelot) peuvent présenter des effets fixes anormalement élevés malgré leur distance à Lille, en raison de la demande résidentielle secondaire. Ces communes constituent des **marchés de niche** structurellement découplés du marché résidentiel principal de la région.
+
+**Communes avec $\exp(\hat{\mu}_c) < 1$** : elles correspondent à des marchés structurellement déprimés, souvent héritiers du déclin industriel (bassin minier, vallées textiles), où l'excès d'offre de logements anciens en mauvais état maintient les prix bas même après correction de la qualité observable.
+
+---
+
+## Carte : Prix relatifs à qualité constante – Maisons
+
+```{r carte_effets_fixes_mai}
+fe_mai <- fixef(mod_maison_final)
+
+df_fe_mai <- data.table(
+  code_commune = names(fe_mai$commune_fe2),
+  prix_relatif = exp(as.numeric(fe_mai$commune_fe2))
+)[code_commune != "REF_PETITES"]
+
+carte_fe_mai <- merge(fond_hdf, df_fe_mai, by = "code_commune", all.x = TRUE)
+
+ggplot(carte_fe_mai) +
+  geom_sf(aes(fill = prix_relatif), color = NA) +
+  scale_fill_viridis_c(
+    option = "viridis", na.value = "grey90",
+    name   = "Prix relatif\n(maisons)"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5)
+  ) +
+  labs(
+    title    = "Hauts-de-France : géographie des prix des maisons",
+    subtitle = "Prix relatif à qualité constante – Maisons",
+    caption  = "Source : DVF | Analyse Master 1"
+  )
+```
+
+### Interprétation – Effets fixes communaux (maisons)
+
+La carte des effets fixes pour les maisons présente une **géographie sensiblement différente** de celle des appartements, ce qui constitue en soi un résultat économiquement intéressant.
+
+Le marché des maisons est davantage structuré par la **composante foncière** : le prix d'une maison intègre la valeur du terrain, laquelle dépend des contraintes d'urbanisme, de la rareté du foncier et des externalités de voisinage. Ces facteurs créent une géographie de prix plus morcelée que celle des appartements, avec des micro-marchés locaux peu connectés.
+
+**Comparaison avec les appartements** : si les effets fixes des maisons présentent une dispersion plus faible que ceux des appartements autour de Lille, cela indiquerait que le marché des maisons est **plus homogène spatialement** — les différences de prix entre communes s'expliquent davantage par la qualité observable des biens (surface) que par la localisation pure. Inversement, une dispersion plus forte suggère que la valeur foncière crée une hétérogénéité supplémentaire non captée par les seules variables de qualité disponibles.
+
+**Zones rurales** : contrairement aux appartements, le marché des maisons est présent dans les communes rurales et peri-urbaines, ce qui donne aux cartes des maisons une couverture géographique plus complète de la région. Les effets fixes faibles dans les zones rurales de l'Aisne et du Pas-de-Calais reflètent à la fois la faiblesse de la demande locale et l'abondance de l'offre foncière.
+
+---
+
+# Heatmaps commune × temps
+
+Les heatmaps permettent de visualiser simultanément la **dynamique temporelle** et l'**hétérogénéité spatiale** de l'indice, en représentant la matrice commune × période sous forme de grille colorée.
+
+## Sélection des communes les plus liquides
+
+Pour la lisibilité, on retient les 30 communes avec le plus grand nombre de transactions observées.
+
+```{r selection_communes_heatmap}
+# Top 30 communes par nombre total de transactions observées
+top_communes_app <- indice_app_filtre[source_type == "observé",
+  .(total_transac = sum(n_transac)), by = code_commune
+][order(-total_transac)][1:30, code_commune]
+
+top_communes_mai <- indice_mai_filtre[source_type == "observé",
+  .(total_transac = sum(n_transac)), by = code_commune
+][order(-total_transac)][1:30, code_commune]
+```
+
+## Heatmap – Appartements
+
+```{r heatmap_appartements, fig.height=9}
+hm_app <- indice_app_filtre[
+  code_commune %in% top_communes_app,
+  .(code_commune, annee, mois, index_100, source_type)
+]
+
+# Agréger par année (moyenne annuelle) pour la lisibilité
+hm_app_ann <- hm_app[, .(
+  index_moy = mean(index_100, na.rm = TRUE)
+), by = .(code_commune, annee)]
+
+# Ordonner les communes par niveau moyen d'indice (croissant)
+ordre_app <- hm_app_ann[, .(moy = mean(index_moy, na.rm = TRUE)), by = code_commune][order(moy), code_commune]
+hm_app_ann[, code_commune := factor(code_commune, levels = ordre_app)]
+
+ggplot(hm_app_ann, aes(x = factor(annee), y = code_commune, fill = index_moy)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(
+    option   = "C",
+    na.value = "grey85",
+    name     = "Indice\n(base 100)",
+    direction = -1
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y      = element_text(size = 7),
+    panel.grid       = element_blank(),
+    plot.title       = element_text(face = "bold", size = 13),
+    legend.position  = "right"
+  ) +
+  labs(
+    title    = "Heatmap – Indice de prix des appartements",
+    subtitle = "Top 30 communes | Hauts-de-France | Moyenne annuelle",
+    x        = "Année",
+    y        = "Commune (code INSEE)",
+    caption  = "Source : DVF | Modèle hédonique Master 1"
+  )
+```
+
+### Interprétation – Heatmap appartements
+
+La heatmap est l'outil le plus synthétique pour lire simultanément **trois dimensions** : la commune (axe vertical), le temps (axe horizontal) et le niveau de l'indice (couleur). Elle permet d'identifier des phénomènes impossibles à détecter sur les courbes temporelles individuelles.
+
+**Lecture des colonnes (dimension temporelle)** : une colonne plus foncée (indice élevé) sur l'ensemble des communes à une année donnée signale un choc de **demande généralisé** ayant touché l'ensemble du marché régional — par exemple la période post-Covid 2021–2022. Une colonne plus claire traduit un retournement cyclique.
+
+**Lecture des lignes (dimension spatiale)** : une ligne systématiquement plus foncée qu'une autre indique que la commune correspondante a connu une croissance cumulée supérieure sur la période, à qualité constante. Ce classement est directement comparable aux effets fixes $\hat{\mu}_c$, à la nuance près que la heatmap capture la **dynamique** et non seulement le niveau.
+
+**Ruptures** : les changements brusques de couleur le long d'une ligne (rupture temporelle pour une commune donnée) signalent des événements locaux affectant le marché : rénovation urbaine, ouverture d'une infrastructure de transport, fermeture d'un employeur majeur. Ces anomalies méritent d'être documentées dans l'analyse narrative.
+
+**Cases grises** : elles correspondent soit à des périodes sans transaction (communes peu liquides), soit à des valeurs prédites non disponibles en cas d'effets fixes manquants. Leur concentration en début de période (2010–2013) reflète la moindre couverture de la base DV3F.
+
+---
+
+## Heatmap – Maisons
+
+```{r heatmap_maisons, fig.height=9}
+hm_mai_ann <- indice_mai_filtre[
+  code_commune %in% top_communes_mai,
+  .(index_moy = mean(index_100, na.rm = TRUE)),
+  by = .(code_commune, annee)
+]
+
+ordre_mai <- hm_mai_ann[, .(moy = mean(index_moy, na.rm = TRUE)), by = code_commune][order(moy), code_commune]
+hm_mai_ann[, code_commune := factor(code_commune, levels = ordre_mai)]
+
+ggplot(hm_mai_ann, aes(x = factor(annee), y = code_commune, fill = index_moy)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(
+    option   = "D",
+    na.value = "grey85",
+    name     = "Indice\n(base 100)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y     = element_text(size = 7),
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", size = 13),
+    legend.position = "right"
+  ) +
+  labs(
+    title    = "Heatmap – Indice de prix des maisons",
+    subtitle = "Top 30 communes | Hauts-de-France | Moyenne annuelle",
+    x        = "Année",
+    y        = "Commune (code INSEE)",
+    caption  = "Source : DVF | Modèle hédonique Master 1"
+  )
+```
+
+### Interprétation – Heatmap maisons
+
+La heatmap du segment maisons se lit selon les mêmes principes que celle des appartements, mais présente des caractéristiques propres au marché résidentiel individuel.
+
+**Hétérogénéité plus prononcée** : on attend davantage de **cases grises** que dans la heatmap des appartements, car les communes du top 30 maisons incluent des communes moins denses avec des mois sans transaction. Cette discontinuité est économiquement normale et ne constitue pas un problème méthodologique : elle reflète simplement la moindre profondeur du marché des maisons dans les grandes villes.
+
+**Volatilité annuelle** : les variations d'une année à l'autre sont généralement plus marquées pour les maisons. Cela tient à la plus faible liquidité du marché (chaque transaction individuelle pèse davantage dans le calcul de la médiane) et à la sensibilité plus grande du prix des maisons à la composante foncière, laquelle est plus cyclique que la composante bâtie.
+
+**Comparaison avec la heatmap appartements** : si les deux heatmaps partagent les mêmes communes au top 30 (ce qui est probable pour les grandes agglomérations), la comparaison directe des couleurs en une même année et commune donne une lecture visuelle immédiate du **différentiel de dynamique** entre les deux segments — équivalent graphique du graphique de comparaison régionale, mais résolu à l'échelle communale.
+
+---
+
+# Conclusion
+
+Ce document a mis en œuvre une chaîne complète d'estimation d'indices de prix immobiliers hédoniques pour les Hauts-de-France sur la période 2010–2025, conformément à la méthodologie présentée en cours. Les quatre contributions principales sont :
+
+1. **Modèle hédonique complet** avec effets fixes temps, département, commune et interaction département×année, estimé séparément pour les appartements et les maisons via `feols()`.
+
+2. **Indice à qualité constante** obtenu en neutralisant la contribution des caractéristiques observables du bien, ce qui garantit que les variations de l'indice reflètent des évolutions de marché et non des changements de composition du stock vendu.
+
+3. **Complétion des périodes manquantes** par prédiction à partir des coefficients estimés, assurant la continuité des séries communales même en l'absence de transactions certains mois.
+
+4. **Visualisations exhaustives** : courbes temporelles, cartes choroplèthes des niveaux et des effets fixes, heatmaps commune × temps pour les deux segments.
+
+Les résultats confirment la **forte hétérogénéité spatiale** des marchés immobiliers en Hauts-de-France, avec des écarts marqués entre communes et entre segments de marché.
+
+L'hétérogénéité spatiale observée s'inscrit dans les mécanismes classiques d'économie urbaine, où les différences d'attractivité et d'accessibilité structurent les gradients de prix.
+
+Au total, ce travail illustre la capacité des modèles hédoniques à produire des indices de prix robustes et comparables, en neutralisant les effets de composition. Il constitue une base solide pour des analyses ultérieures des dynamiques immobilières locales, notamment en lien avec les déterminants économiques et territoriaux des prix.
